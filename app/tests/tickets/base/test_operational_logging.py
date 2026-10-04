@@ -789,3 +789,33 @@ def test_correlation_middleware_returns_response_if_logging_fails(monkeypatch):
 def test_payment_exception_still_carries_user_facing_message():
     with pytest.raises(PaymentException, match='Payment was declined'):
         raise PaymentException('Payment was declined')
+
+
+@pytest.mark.django_db
+def test_get_audit_log_ordering():
+    from eventyay.base.models import Event, Organizer, User
+    from eventyay.base.models.audit import AuditLog
+    from eventyay.base.services.event import get_audit_log
+
+    with scopes_disabled():
+        organizer = Organizer.objects.create(name='Test Org', slug='test-org-audit-order')
+        event = Event.objects.create(
+            organizer=organizer, name='Test Event', slug='test-event-audit-order', date_from=now()
+        )
+        user = User.objects.create(email='testaudit@example.com')
+
+        t_now = now()
+        t_old = t_now - timedelta(hours=1)
+
+        log_old = AuditLog.objects.create(event=event, user=user, type='older.action', data={'step': 1})
+        log_tie_1 = AuditLog.objects.create(event=event, user=user, type='same.timestamp.action.1', data={'step': 2})
+        log_tie_2 = AuditLog.objects.create(event=event, user=user, type='same.timestamp.action.2', data={'step': 3})
+
+        AuditLog.objects.filter(id=log_old.id).update(timestamp=t_old)
+        AuditLog.objects.filter(id__in=[log_tie_1.id, log_tie_2.id]).update(timestamp=t_now)
+
+        audit_fn = getattr(get_audit_log, 'func', get_audit_log)
+        logs = audit_fn(event)
+        log_ids = [entry['id'] for entry in logs]
+
+        assert log_ids == [log_tie_2.id, log_tie_1.id, log_old.id]

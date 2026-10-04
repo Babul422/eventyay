@@ -865,5 +865,5 @@ def get_audit_log(event):
         a.serialize_public()
         for a in AuditLog.objects.filter(
             event_id=event.id,
-        ).prefetch_related("user")
+        ).prefetch_related("user").order_by("-timestamp", "-id")
     ]
