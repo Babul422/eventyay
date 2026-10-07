@@ -212,6 +212,12 @@
                             </td>
                         {% endif %}
                     </tr>
+                {% empty %}
+                    <tr>
+                        <td colspan="8" class="text-muted">
+                            {% translate "No submissions found." %}
+                        </td>
+                    </tr>
                 {% endfor %}
             </tbody>
         </table>

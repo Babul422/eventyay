@@ -124,7 +124,7 @@
                             <span class="label label-default">{% trans "Series" %}</span>
                         {% endif %}
                         {% if e.settings.show_date_to and e.date_to %}
-                            –<br>
+                             –<br>
                             {% if e.has_subevents %}
                                 {{ e.max_fromto|default_if_none:e.max_from|default_if_none:e.max_to|default_if_none:""|date:"SHORT_DATETIME_FORMAT" }}
                             {% else %}
@@ -160,6 +160,12 @@
                             </a>
                         {% endif %}
                     </td>
+                    </tr>
+                {% empty %}
+                    <tr>
+                        <td colspan="4" class="text-muted">
+                            {% trans "No events found." %}
+                        </td>
                     </tr>
                 {% endfor %}
                 </tbody>
