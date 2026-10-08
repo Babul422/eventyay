@@ -213,13 +213,11 @@
                         {% endif %}
                     </tr>
                 {% empty %}
-                    {% with use_tracks=request.event|get_feature_flag:"use_tracks" %}
-                        <tr>
-                            <td colspan="{% if can_change_submission %}{% if session_videos_enabled %}{% if can_view_speakers and show_submission_types and use_tracks %}8{% elif can_view_speakers and show_submission_types or can_view_speakers and use_tracks or show_submission_types and use_tracks %}7{% elif can_view_speakers or show_submission_types or use_tracks %}6{% else %}5{% endif %}{% else %}{% if can_view_speakers and show_submission_types and use_tracks %}7{% elif can_view_speakers and show_submission_types or can_view_speakers and use_tracks or show_submission_types and use_tracks %}6{% elif can_view_speakers or show_submission_types or use_tracks %}5{% else %}4{% endif %}{% endif %}{% else %}{% if can_view_speakers and show_submission_types and use_tracks %}5{% elif can_view_speakers and show_submission_types or can_view_speakers and use_tracks or show_submission_types and use_tracks %}4{% elif can_view_speakers or show_submission_types or use_tracks %}3{% else %}2{% endif %}{% endif %}" class="text-muted">
-                                {% translate "No submissions found." %}
-                            </td>
-                        </tr>
-                    {% endwith %}
+                    <tr>
+                        <td colspan="{{ submission_colspan }}" class="text-muted">
+                            {% translate "No submissions found." %}
+                        </td>
+                    </tr>
                 {% endfor %}
             </tbody>
         </table>
