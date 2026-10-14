@@ -840,3 +840,452 @@ def test_ticket_mail_template_form_validates_reply_to_and_bcc(event):
     )
     assert valid.is_valid(), valid.errors
     assert valid.cleaned_data['bcc'] == 'a@example.com, b@example.com'
+
+
+@pytest.mark.django_db
+@override_settings(DEBUG=True)
+def test_sendmail_allowed_records_usage(logged_in_client, sendmail_url, event, order, pos):
+    from eventyay.base.signals import entitlement_usage_recorded
+    from eventyay.plugins.sendmail.models import EmailQueue
+
+    usage_events = []
+
+    def on_usage(sender, **kwargs):
+        usage_events.append((sender, kwargs))
+
+    entitlement_usage_recorded.connect(on_usage)
+    try:
+        response = logged_in_client.post(
+            sendmail_url,
+            {
+                'order_status': 'na',
+                'recipients': 'orders',
+                'products': [pos.product_id],
+                'subject_0': 'Allowed test subject',
+                'text_0': 'Message for outbox.',
+            },
+            follow=True,
+        )
+        assert response.status_code == 200
+        assert 'alert-success' in response.rendered_content
+
+        queue = EmailQueue.objects.filter(event=event, is_draft=False).first()
+        assert queue is not None
+        assert str(queue.subject) == 'Allowed test subject'
+
+        assert len(usage_events) == 1
+        sender, kwargs = usage_events[0]
+        assert sender == event.organizer
+        assert kwargs['capability'] == 'email.bulk.monthly'
+        assert kwargs['quantity'] == 1
+        assert kwargs['unit'] == 'emails'
+        assert kwargs['source_type'] == 'ticket_bulk_email'
+        assert kwargs['source_id'] == str(queue.pk)
+        assert kwargs['idempotency_key'] == f'ticket_bulk_mail_{queue.pk}'
+        assert kwargs['event'] == event
+    finally:
+        entitlement_usage_recorded.disconnect(on_usage)
+
+
+@pytest.mark.django_db
+@override_settings(DEBUG=True)
+def test_sendmail_denied_by_entitlement(logged_in_client, sendmail_url, event, order, pos):
+    from eventyay.base.entitlements import EntitlementDecision
+    from eventyay.base.signals import entitlement_check, entitlement_usage_recorded
+    from eventyay.plugins.sendmail.models import EmailQueue
+
+    def on_check(sender, capability, **kwargs):
+        if capability == 'email.bulk.monthly':
+            return EntitlementDecision(
+                allowed=False,
+                reason_code='limit_reached',
+                message='Monthly bulk email quota exceeded for plan.',
+            )
+        return EntitlementDecision(allowed=True)
+
+    usage_events = []
+
+    def on_usage(sender, **kwargs):
+        usage_events.append((sender, kwargs))
+
+    entitlement_check.connect(on_check)
+    entitlement_usage_recorded.connect(on_usage)
+    try:
+        response = logged_in_client.post(
+            sendmail_url,
+            {
+                'order_status': 'na',
+                'recipients': 'orders',
+                'products': [pos.product_id],
+                'subject_0': 'Denied test subject',
+                'text_0': 'This message should not be sent.',
+            },
+            follow=True,
+        )
+        assert response.status_code == 200
+        assert 'Monthly bulk email quota exceeded for plan.' in response.rendered_content
+        # Ensure temporary queue item was cleaned up and not saved to outbox
+        assert EmailQueue.objects.filter(event=event).count() == 0
+        assert len(usage_events) == 0
+    finally:
+        entitlement_check.disconnect(on_check)
+        entitlement_usage_recorded.disconnect(on_usage)
+
+
+@pytest.mark.django_db
+@override_settings(DEBUG=True)
+def test_sendmail_unique_recipient_deduplication(logged_in_client, sendmail_url, event, order, pos, item):
+    from eventyay.base.signals import entitlement_check, entitlement_usage_recorded
+    from eventyay.plugins.sendmail.models import EmailQueue
+
+    # Create a second order with the same email address in UPPERCASE
+    order2 = Order.objects.create(
+        event=item.event,
+        status=Order.STATUS_PENDING,
+        expires=now() + datetime.timedelta(hours=1),
+        total=13,
+        code='DUMMY2',
+        email=order.email.upper(),
+        datetime=now(),
+        locale='en',
+    )
+    OrderPosition.objects.create(order=order2, product=item, price=13)
+
+    check_quantities = []
+
+    def on_check(sender, capability, quantity=1, **kwargs):
+        if capability == 'email.bulk.monthly':
+            check_quantities.append(quantity)
+        return None
+
+    usage_events = []
+
+    def on_usage(sender, **kwargs):
+        usage_events.append((sender, kwargs))
+
+    entitlement_check.connect(on_check)
+    entitlement_usage_recorded.connect(on_usage)
+    try:
+        response = logged_in_client.post(
+            sendmail_url,
+            {
+                'order_status': 'na',
+                'recipients': 'orders',
+                'products': [pos.product_id],
+                'subject_0': 'Deduplication test',
+                'text_0': 'Testing deduplicated recipients.',
+            },
+            follow=True,
+        )
+        assert response.status_code == 200
+        assert 'alert-success' in response.rendered_content
+
+        queue = EmailQueue.objects.filter(event=event, is_draft=False).first()
+        assert queue is not None
+        assert queue.get_recipient_emails() == [order.email.lower()]
+
+        # 2 orders but only 1 unique recipient
+        assert check_quantities == [1]
+        assert len(usage_events) == 1
+        assert usage_events[0][1]['quantity'] == 1
+    finally:
+        entitlement_check.disconnect(on_check)
+        entitlement_usage_recorded.disconnect(on_usage)
+
+
+@pytest.mark.django_db
+@override_settings(DEBUG=True)
+def test_sendmail_draft_and_test_exempt(logged_in_client, sendmail_url, event, order, pos):
+    from eventyay.base.entitlements import EntitlementDecision
+    from eventyay.base.signals import entitlement_check, entitlement_usage_recorded
+    from eventyay.plugins.sendmail.models import EmailQueue
+
+    check_calls = []
+
+    def on_check(sender, capability, **kwargs):
+        check_calls.append((sender, capability, kwargs))
+        if capability == 'email.bulk.monthly':
+            return EntitlementDecision(allowed=False, message='Should not trigger for draft or test')
+        return EntitlementDecision(allowed=True)
+
+    usage_events = []
+
+    def on_usage(sender, **kwargs):
+        usage_events.append((sender, kwargs))
+
+    entitlement_check.connect(on_check)
+    entitlement_usage_recorded.connect(on_usage)
+    try:
+        # 1. Draft save should be exempt
+        response = logged_in_client.post(
+            sendmail_url,
+            {
+                'order_status': 'na',
+                'recipients': 'orders',
+                'products': [pos.product_id],
+                'subject_0': 'Draft subject',
+                'text_0': 'Draft message.',
+                'action': 'draft',
+            },
+            follow=True,
+        )
+        assert response.status_code == 200
+        assert 'alert-success' in response.rendered_content
+        draft = EmailQueue.objects.filter(event=event, is_draft=True).first()
+        assert draft is not None
+        assert len(check_calls) == 0
+        assert len(usage_events) == 0
+
+        # 2. Preview should be exempt
+        response = logged_in_client.post(
+            sendmail_url,
+            {
+                'order_status': 'na',
+                'recipients': 'orders',
+                'products': [pos.product_id],
+                'subject_0': 'Preview subject',
+                'text_0': 'Preview message.',
+                'action': 'preview',
+            },
+            follow=True,
+        )
+        assert response.status_code == 200
+        assert len(check_calls) == 0
+        assert len(usage_events) == 0
+
+        # 3. Single test email should be exempt
+        response = logged_in_client.post(
+            sendmail_url,
+            {
+                'order_status': 'na',
+                'recipients': 'orders',
+                'products': [pos.product_id],
+                'subject_0': 'Test email subject',
+                'text_0': 'Test email message.',
+                'test_email': 'testpreview@example.com',
+                'action': 'test',
+            },
+            follow=True,
+        )
+        assert response.status_code == 200
+        assert 'alert-success' in response.rendered_content
+        assert len(check_calls) == 0
+        assert len(usage_events) == 0
+    finally:
+        entitlement_check.disconnect(on_check)
+        entitlement_usage_recorded.disconnect(on_usage)
+
+
+@pytest.mark.django_db
+@override_settings(DEBUG=True)
+def test_sendmail_preserve_existing_draft_on_denial(logged_in_client, sendmail_url, event, order, pos):
+    from eventyay.base.entitlements import EntitlementDecision
+    from eventyay.base.signals import entitlement_check, entitlement_usage_recorded
+    from eventyay.plugins.sendmail.models import ComposingFor, EmailQueue, EmailQueueFilter
+
+    # Create an existing draft
+    draft = EmailQueue.objects.create(
+        event=event,
+        composing_for=ComposingFor.ATTENDEES,
+        subject='Existing Draft Subject',
+        message='Existing Draft Message',
+        is_draft=True,
+    )
+    EmailQueueFilter.objects.create(
+        mail=draft,
+        recipients='orders',
+        order_status=['na'],
+        orders=[order.pk],
+        products=[pos.product_id],
+    )
+
+    def on_check(sender, capability, **kwargs):
+        if capability == 'email.bulk.monthly':
+            return EntitlementDecision(
+                allowed=False,
+                reason_code='limit_reached',
+                message='Quota denied for sending.',
+            )
+        return EntitlementDecision(allowed=True)
+
+    usage_events = []
+
+    def on_usage(sender, **kwargs):
+        usage_events.append((sender, kwargs))
+
+    entitlement_check.connect(on_check)
+    entitlement_usage_recorded.connect(on_usage)
+    try:
+        # User attempts to send the draft to outbox
+        response = logged_in_client.post(
+            sendmail_url,
+            {
+                'draft_id': draft.pk,
+                'order_status': 'na',
+                'recipients': 'orders',
+                'products': [pos.product_id],
+                'subject_0': 'Updated Draft Subject',
+                'text_0': 'Updated Draft Message',
+            },
+            follow=True,
+        )
+        assert response.status_code == 200
+        assert 'Quota denied for sending.' in response.rendered_content
+
+        # Verify draft was NOT deleted and remains marked as draft
+        draft.refresh_from_db()
+        assert draft.is_draft is True
+        assert str(draft.subject) == 'Updated Draft Subject'
+        assert len(usage_events) == 0
+    finally:
+        entitlement_check.disconnect(on_check)
+        entitlement_usage_recorded.disconnect(on_usage)
+
+
+@pytest.mark.django_db
+@override_settings(DEBUG=True)
+def test_sendmail_teams_entitlement_and_deduplication(logged_in_client, event):
+    from eventyay.base.entitlements import EntitlementDecision
+    from eventyay.base.signals import entitlement_check, entitlement_usage_recorded
+    from eventyay.plugins.sendmail.models import ComposingFor, EmailQueue
+
+    # Create 1 user in 2 teams to verify recipient deduplication across teams
+    u1 = User.objects.create(email='colleague@example.com')
+    team1 = Team.objects.create(organizer=event.organizer, name='Operations', can_view_orders=True)
+    team2 = Team.objects.create(organizer=event.organizer, name='Logistics', can_view_orders=True)
+    team1.members.add(u1)
+    team2.members.add(u1)
+
+    compose_teams_url = reverse(
+        'control:event.mail.compose_teams',
+        kwargs={'organizer': event.organizer.slug, 'event': event.slug},
+    )
+
+    # 1. Test denial
+    def on_check_deny(sender, capability, **kwargs):
+        if capability == 'email.bulk.monthly':
+            return EntitlementDecision(allowed=False, message='Team email monthly quota exceeded')
+        return EntitlementDecision(allowed=True)
+
+    entitlement_check.connect(on_check_deny)
+    try:
+        response = logged_in_client.post(
+            compose_teams_url,
+            {
+                'teams': [team1.pk, team2.pk],
+                'subject_0': 'Team Update',
+                'message_0': 'Important team update message.',
+            },
+            follow=True,
+        )
+        assert response.status_code == 200
+        assert 'Team email monthly quota exceeded' in response.rendered_content
+        assert EmailQueue.objects.filter(event=event, composing_for=ComposingFor.TEAMS).count() == 0
+    finally:
+        entitlement_check.disconnect(on_check_deny)
+
+    # 2. Test allowed with recipient deduplication
+    check_quantities = []
+
+    def on_check_allow(sender, capability, quantity=1, **kwargs):
+        if capability == 'email.bulk.monthly':
+            check_quantities.append(quantity)
+        return None
+
+    usage_events = []
+
+    def on_usage(sender, **kwargs):
+        usage_events.append((sender, kwargs))
+
+    entitlement_check.connect(on_check_allow)
+    entitlement_usage_recorded.connect(on_usage)
+    try:
+        response = logged_in_client.post(
+            compose_teams_url,
+            {
+                'teams': [team1.pk, team2.pk],
+                'subject_0': 'Team Update Allowed',
+                'message_0': 'Important team update message.',
+            },
+            follow=True,
+        )
+        assert response.status_code == 200
+        assert 'alert-success' in response.rendered_content
+
+        queue = EmailQueue.objects.filter(event=event, composing_for=ComposingFor.TEAMS, is_draft=False).first()
+        assert queue is not None
+        assert queue.get_recipient_emails() == ['colleague@example.com']
+
+        # User was in 2 selected teams but deduplicated to 1 unique recipient
+        assert check_quantities == [1]
+        assert len(usage_events) == 1
+        assert usage_events[0][1]['quantity'] == 1
+        assert usage_events[0][1]['source_type'] == 'ticket_bulk_email'
+        assert usage_events[0][1]['source_id'] == str(queue.pk)
+        assert usage_events[0][1]['idempotency_key'] == f'ticket_bulk_mail_{queue.pk}'
+    finally:
+        entitlement_check.disconnect(on_check_allow)
+        entitlement_usage_recorded.disconnect(on_usage)
+
+
+@pytest.mark.django_db
+@override_settings(DEBUG=True)
+def test_sendmail_teams_preserve_existing_draft_on_denial(logged_in_client, event):
+    from eventyay.base.entitlements import EntitlementDecision
+    from eventyay.base.signals import entitlement_check, entitlement_usage_recorded
+    from eventyay.plugins.sendmail.models import ComposingFor, EmailQueue, EmailQueueFilter
+
+    u = User.objects.create(email='crew@example.com')
+    team = Team.objects.create(organizer=event.organizer, name='Crew', can_view_orders=True)
+    team.members.add(u)
+
+    draft = EmailQueue.objects.create(
+        event=event,
+        composing_for=ComposingFor.TEAMS,
+        subject='Team Draft Subject',
+        message='Team Draft Message',
+        is_draft=True,
+    )
+    EmailQueueFilter.objects.create(
+        mail=draft,
+        teams=[team.pk],
+    )
+
+    compose_teams_url = reverse(
+        'control:event.mail.compose_teams',
+        kwargs={'organizer': event.organizer.slug, 'event': event.slug},
+    )
+
+    def on_check(sender, capability, **kwargs):
+        if capability == 'email.bulk.monthly':
+            return EntitlementDecision(allowed=False, message='Quota denied for team mail.')
+        return EntitlementDecision(allowed=True)
+
+    usage_events = []
+
+    def on_usage(sender, **kwargs):
+        usage_events.append((sender, kwargs))
+
+    entitlement_check.connect(on_check)
+    entitlement_usage_recorded.connect(on_usage)
+    try:
+        response = logged_in_client.post(
+            compose_teams_url,
+            {
+                'draft_id': draft.pk,
+                'teams': [team.pk],
+                'subject_0': 'Updated Team Draft Subject',
+                'message_0': 'Updated Team Draft Message',
+            },
+            follow=True,
+        )
+        assert response.status_code == 200
+        assert 'Quota denied for team mail.' in response.rendered_content
+
+        draft.refresh_from_db()
+        assert draft.is_draft is True
+        assert str(draft.subject) == 'Updated Team Draft Subject'
+        assert len(usage_events) == 0
+    finally:
+        entitlement_check.disconnect(on_check)
+        entitlement_usage_recorded.disconnect(on_usage)
