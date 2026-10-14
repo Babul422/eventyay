@@ -20,6 +20,7 @@ from i18nfield.strings import LazyI18nString
 from eventyay.base.meetup import is_meetup_event
 from eventyay.base.models.base import CachedFile
 from eventyay.base.models.event import Event
+from eventyay.base.models.organizer import Organizer
 from eventyay.base.models.orders import OrderPosition
 from eventyay.base.operational_logging import OUTCOME_FAILURE, log_event
 from eventyay.base.services.mail import expand_email_variable_chips, mail
@@ -439,26 +440,29 @@ class SenderView(EventPermissionRequiredMixin, CopyDraftMixin, BulkReplyToMixin,
             )
 
         recipients_count = len(unique_recipients)
-        decision = check_entitlement(
-            self.request.event.organizer,
-            'email.bulk.monthly',
-            event=self.request.event,
-            quantity=recipients_count,
-        )
-        if not decision.allowed:
-            if not is_existing_draft:
-                qm.delete()
-            else:
-                qm.is_draft = True
-                qm.save(update_fields=['is_draft'])
-            error_msg = decision.message or _(
-                'You have reached the limit for sending bulk emails on your plan.'
-            )
-            form.add_error(None, error_msg)
-            messages.error(self.request, error_msg)
-            return self.form_invalid(form)
 
         with transaction.atomic():
+            Organizer.objects.select_for_update().filter(pk=self.request.event.organizer_id).first()
+
+            decision = check_entitlement(
+                self.request.event.organizer,
+                'email.bulk.monthly',
+                event=self.request.event,
+                quantity=recipients_count,
+            )
+            if not decision.allowed:
+                if not is_existing_draft:
+                    qm.delete()
+                else:
+                    qm.is_draft = True
+                    qm.save(update_fields=['is_draft'])
+                error_msg = decision.message or _(
+                    'You have reached the limit for sending bulk emails on your plan.'
+                )
+                form.add_error(None, error_msg)
+                messages.error(self.request, error_msg)
+                return self.form_invalid(form)
+
             qm.is_draft = False
             qm.save(update_fields=['is_draft'])
             record_usage(
@@ -472,10 +476,12 @@ class SenderView(EventPermissionRequiredMixin, CopyDraftMixin, BulkReplyToMixin,
                 event=self.request.event,
             )
 
+            if scheduled_at:
+                transaction.on_commit(
+                    lambda: send_queued_mail.apply_async(args=[self.request.event.pk, qm.pk], eta=scheduled_at)
+                )
+
         if scheduled_at:
-            transaction.on_commit(
-                lambda: send_queued_mail.apply_async(args=[self.request.event.pk, qm.pk], eta=scheduled_at)
-            )
             self.request.event.log_action(
                 'eventyay.sendmail.scheduled',
                 user=self.request.user,
@@ -1396,7 +1402,7 @@ class ComposeTeamsMail(EventPermissionRequiredMixin, CopyDraftMixin, BulkReplyTo
                 if not raw_email:
                     continue
                 norm_email = raw_email.strip().lower()
-                if norm_email in seen_emails:
+                if not norm_email or norm_email in seen_emails:
                     continue
                 seen_emails.add(norm_email)
                 recipients_list.append({
@@ -1414,6 +1420,7 @@ class ComposeTeamsMail(EventPermissionRequiredMixin, CopyDraftMixin, BulkReplyTo
             return self.form_invalid(form)
 
         if not recipients_list and not is_draft:
+            form.add_error(None, _('There are no valid recipients for the selected teams.'))
             messages.error(self.request, _('There are no valid recipients for the selected teams.'))
             return self.form_invalid(form)
 
@@ -1504,6 +1511,7 @@ class ComposeTeamsMail(EventPermissionRequiredMixin, CopyDraftMixin, BulkReplyTo
                 error=rec["error"]
             )
             for rec in recipients_list
+            if rec.get("email") and rec["email"].strip()
         ]
         if recipient_objs:
             EmailQueueToUser.objects.bulk_create(recipient_objs)
@@ -1522,27 +1530,41 @@ class ComposeTeamsMail(EventPermissionRequiredMixin, CopyDraftMixin, BulkReplyTo
                 organizer=event.organizer.slug,
             )
 
-        recipients_count = len(mail_instance.get_recipient_emails())
-        decision = check_entitlement(
-            event.organizer,
-            'email.bulk.monthly',
-            event=event,
-            quantity=recipients_count,
-        )
-        if not decision.allowed:
+        unique_recipients = mail_instance.get_recipient_emails()
+        if not is_draft and not unique_recipients:
             if not is_existing_draft:
                 mail_instance.delete()
             else:
                 mail_instance.is_draft = True
                 mail_instance.save(update_fields=['is_draft'])
-            error_msg = decision.message or _(
-                'You have reached the limit for sending bulk emails on your plan.'
-            )
-            form.add_error(None, error_msg)
-            messages.error(self.request, error_msg)
+            form.add_error(None, _('There are no valid recipients for the selected teams.'))
+            messages.error(self.request, _('There are no valid recipients for the selected teams.'))
             return self.form_invalid(form)
 
+        recipients_count = len(unique_recipients)
+
         with transaction.atomic():
+            Organizer.objects.select_for_update().filter(pk=event.organizer_id).first()
+
+            decision = check_entitlement(
+                event.organizer,
+                'email.bulk.monthly',
+                event=event,
+                quantity=recipients_count,
+            )
+            if not decision.allowed:
+                if not is_existing_draft:
+                    mail_instance.delete()
+                else:
+                    mail_instance.is_draft = True
+                    mail_instance.save(update_fields=['is_draft'])
+                error_msg = decision.message or _(
+                    'You have reached the limit for sending bulk emails on your plan.'
+                )
+                form.add_error(None, error_msg)
+                messages.error(self.request, error_msg)
+                return self.form_invalid(form)
+
             mail_instance.is_draft = False
             mail_instance.save(update_fields=['is_draft'])
             record_usage(
@@ -1556,10 +1578,12 @@ class ComposeTeamsMail(EventPermissionRequiredMixin, CopyDraftMixin, BulkReplyTo
                 event=event,
             )
 
+            if scheduled_at:
+                transaction.on_commit(
+                    lambda: send_queued_mail.apply_async(args=[event.pk, mail_instance.pk], eta=scheduled_at)
+                )
+
         if scheduled_at:
-            transaction.on_commit(
-                lambda: send_queued_mail.apply_async(args=[event.pk, mail_instance.pk], eta=scheduled_at)
-            )
             event.log_action(
                 'eventyay.sendmail.scheduled',
                 user=user,

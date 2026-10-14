@@ -1289,3 +1289,270 @@ def test_sendmail_teams_preserve_existing_draft_on_denial(logged_in_client, even
     finally:
         entitlement_check.disconnect(on_check)
         entitlement_usage_recorded.disconnect(on_usage)
+
+
+@pytest.mark.django_db
+@override_settings(DEBUG=True)
+def test_sendmail_attendee_whitespace_only_recipients_rejected(logged_in_client, sendmail_url, event, item):
+    from eventyay.base.signals import entitlement_usage_recorded
+    from eventyay.plugins.sendmail.models import EmailQueue
+
+    event.settings.attendee_emails_asked = True
+
+    order_blank = Order.objects.create(
+        event=event,
+        status=Order.STATUS_PENDING,
+        expires=now() + datetime.timedelta(hours=1),
+        total=13,
+        code='BLANK1',
+        email='   ',
+        datetime=now(),
+        locale='en',
+    )
+    OrderPosition.objects.create(order=order_blank, product=item, price=13, attendee_email='   ')
+
+    usage_events = []
+
+    def on_usage(sender, **kwargs):
+        usage_events.append((sender, kwargs))
+
+    entitlement_usage_recorded.connect(on_usage)
+    try:
+        response = logged_in_client.post(
+            sendmail_url,
+            {
+                'order_status': 'na',
+                'recipients': 'both',
+                'products': [item.pk],
+                'subject_0': 'Blank recipient test',
+                'text_0': 'Testing blank recipients rejection.',
+            },
+            follow=True,
+        )
+        assert response.status_code == 200
+        assert 'There are no valid email addresses for the selected recipients.' in response.rendered_content
+        assert EmailQueue.objects.filter(event=event, is_draft=False).count() == 0
+        assert len(usage_events) == 0
+    finally:
+        entitlement_usage_recorded.disconnect(on_usage)
+
+
+@pytest.mark.django_db
+@override_settings(DEBUG=True)
+def test_sendmail_team_whitespace_only_recipients_rejected(logged_in_client, event):
+    from eventyay.base.signals import entitlement_usage_recorded
+    from eventyay.plugins.sendmail.models import EmailQueue
+
+    u_blank = User.objects.create(email='   ')
+    team = Team.objects.create(organizer=event.organizer, name='BlankTeam', can_view_orders=True)
+    team.members.add(u_blank)
+
+    compose_teams_url = reverse(
+        'control:event.mail.compose_teams',
+        kwargs={'organizer': event.organizer.slug, 'event': event.slug},
+    )
+
+    usage_events = []
+
+    def on_usage(sender, **kwargs):
+        usage_events.append((sender, kwargs))
+
+    entitlement_usage_recorded.connect(on_usage)
+    try:
+        response = logged_in_client.post(
+            compose_teams_url,
+            {
+                'teams': [team.pk],
+                'subject_0': 'Blank team recipient test',
+                'message_0': 'Testing blank team recipients rejection.',
+            },
+            follow=True,
+        )
+        assert response.status_code == 200
+        assert 'There are no valid recipients for the selected teams.' in response.rendered_content
+        assert EmailQueue.objects.filter(event=event, is_draft=False).count() == 0
+        assert len(usage_events) == 0
+    finally:
+        entitlement_usage_recorded.disconnect(on_usage)
+
+
+@pytest.mark.django_db
+@override_settings(DEBUG=True)
+def test_sendmail_mixed_recipients_whitespace_and_duplicates(logged_in_client, sendmail_url, event, item):
+    from eventyay.base.signals import entitlement_check, entitlement_usage_recorded
+    from eventyay.plugins.sendmail.models import EmailQueue
+
+    event.settings.attendee_emails_asked = True
+
+    o1 = Order.objects.create(
+        event=event,
+        status=Order.STATUS_PENDING,
+        expires=now() + datetime.timedelta(hours=1),
+        total=13,
+        code='MIX1',
+        email='valid1@example.com',
+        datetime=now(),
+        locale='en',
+    )
+    OrderPosition.objects.create(order=o1, product=item, price=13)
+
+    o2 = Order.objects.create(
+        event=event,
+        status=Order.STATUS_PENDING,
+        expires=now() + datetime.timedelta(hours=1),
+        total=13,
+        code='MIX2',
+        email='   ',
+        datetime=now(),
+        locale='en',
+    )
+    OrderPosition.objects.create(order=o2, product=item, price=13, attendee_email='   ')
+
+    o3 = Order.objects.create(
+        event=event,
+        status=Order.STATUS_PENDING,
+        expires=now() + datetime.timedelta(hours=1),
+        total=13,
+        code='MIX3',
+        email='VALID1@EXAMPLE.COM',
+        datetime=now(),
+        locale='en',
+    )
+    OrderPosition.objects.create(order=o3, product=item, price=13)
+
+    o4 = Order.objects.create(
+        event=event,
+        status=Order.STATUS_PENDING,
+        expires=now() + datetime.timedelta(hours=1),
+        total=13,
+        code='MIX4',
+        email='valid2@example.com',
+        datetime=now(),
+        locale='en',
+    )
+    OrderPosition.objects.create(order=o4, product=item, price=13)
+
+    checked_quantities = []
+
+    def on_check(sender, capability, quantity=1, **kwargs):
+        if capability == 'email.bulk.monthly':
+            checked_quantities.append(quantity)
+        return None
+
+    usage_events = []
+
+    def on_usage(sender, **kwargs):
+        usage_events.append((sender, kwargs))
+
+    entitlement_check.connect(on_check)
+    entitlement_usage_recorded.connect(on_usage)
+    try:
+        response = logged_in_client.post(
+            sendmail_url,
+            {
+                'order_status': 'na',
+                'recipients': 'both',
+                'products': [item.pk],
+                'subject_0': 'Mixed recipient test',
+                'text_0': 'Testing mixed recipients counting.',
+            },
+            follow=True,
+        )
+        assert response.status_code == 200
+        assert 'alert-success' in response.rendered_content
+
+        queue = EmailQueue.objects.filter(event=event, is_draft=False).first()
+        assert queue is not None
+        assert queue.get_recipient_emails() == ['valid1@example.com', 'valid2@example.com']
+        assert not queue.recipients.filter(email='').exists()
+        assert not queue.recipients.filter(email='   ').exists()
+
+        assert checked_quantities == [2]
+        assert len(usage_events) == 1
+        assert usage_events[0][1]['quantity'] == 2
+    finally:
+        entitlement_check.disconnect(on_check)
+        entitlement_usage_recorded.disconnect(on_usage)
+
+
+@pytest.mark.django_db
+@override_settings(DEBUG=True)
+def test_sendmail_attendee_serializes_with_organizer_select_for_update(logged_in_client, sendmail_url, event, order, pos, monkeypatch):
+    from eventyay.base.models.organizer import Organizer
+
+    locked_organizers = []
+    real_select_for_update = Organizer.objects.select_for_update
+
+    def spy_select_for_update(*args, **kwargs):
+        qs = real_select_for_update(*args, **kwargs)
+        real_filter = qs.filter
+
+        def spy_filter(*f_args, **f_kwargs):
+            if 'pk' in f_kwargs:
+                locked_organizers.append(f_kwargs['pk'])
+            return real_filter(*f_args, **f_kwargs)
+
+        qs.filter = spy_filter
+        return qs
+
+    monkeypatch.setattr(Organizer.objects, 'select_for_update', spy_select_for_update)
+
+    response = logged_in_client.post(
+        sendmail_url,
+        {
+            'order_status': 'na',
+            'recipients': 'orders',
+            'products': [pos.product_id],
+            'subject_0': 'Locking test subject',
+            'text_0': 'Testing organizer lock serialization.',
+        },
+        follow=True,
+    )
+    assert response.status_code == 200
+    assert 'alert-success' in response.rendered_content
+    assert locked_organizers == [event.organizer_id]
+
+
+@pytest.mark.django_db
+@override_settings(DEBUG=True)
+def test_sendmail_team_serializes_with_organizer_select_for_update(logged_in_client, event, monkeypatch):
+    from eventyay.base.models.organizer import Organizer
+
+    u = User.objects.create(email='crew_lock@example.com')
+    team = Team.objects.create(organizer=event.organizer, name='LockCrew', can_view_orders=True)
+    team.members.add(u)
+
+    compose_teams_url = reverse(
+        'control:event.mail.compose_teams',
+        kwargs={'organizer': event.organizer.slug, 'event': event.slug},
+    )
+
+    locked_organizers = []
+    real_select_for_update = Organizer.objects.select_for_update
+
+    def spy_select_for_update(*args, **kwargs):
+        qs = real_select_for_update(*args, **kwargs)
+        real_filter = qs.filter
+
+        def spy_filter(*f_args, **f_kwargs):
+            if 'pk' in f_kwargs:
+                locked_organizers.append(f_kwargs['pk'])
+            return real_filter(*f_args, **f_kwargs)
+
+        qs.filter = spy_filter
+        return qs
+
+    monkeypatch.setattr(Organizer.objects, 'select_for_update', spy_select_for_update)
+
+    response = logged_in_client.post(
+        compose_teams_url,
+        {
+            'teams': [team.pk],
+            'subject_0': 'Team Lock Subject',
+            'message_0': 'Testing team organizer lock.',
+        },
+        follow=True,
+    )
+    assert response.status_code == 200
+    assert 'alert-success' in response.rendered_content
+    assert locked_organizers == [event.organizer_id]
