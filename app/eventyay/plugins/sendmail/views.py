@@ -22,7 +22,7 @@ from eventyay.base.models.base import CachedFile
 from eventyay.base.models.event import Event
 from eventyay.base.models.organizer import Organizer
 from eventyay.base.models.orders import OrderPosition
-from eventyay.base.operational_logging import OUTCOME_FAILURE, log_event
+from eventyay.base.operational_logging import OUTCOME_FAILURE, OUTCOME_SUCCESS, log_event
 from eventyay.base.services.mail import expand_email_variable_chips, mail
 from eventyay.base.templatetags.rich_text import (
     build_email_preview_context,
@@ -465,6 +465,7 @@ class SenderView(EventPermissionRequiredMixin, CopyDraftMixin, BulkReplyToMixin,
 
             qm.is_draft = False
             qm.save(update_fields=['is_draft'])
+            log_event('mail', 'mail.enqueue', OUTCOME_SUCCESS, event_id=getattr(qm.event, 'pk', None), object_id=qm.pk)
             record_usage(
                 self.request.event.organizer,
                 'email.bulk.monthly',
@@ -1567,6 +1568,7 @@ class ComposeTeamsMail(EventPermissionRequiredMixin, CopyDraftMixin, BulkReplyTo
 
             mail_instance.is_draft = False
             mail_instance.save(update_fields=['is_draft'])
+            log_event('mail', 'mail.enqueue', OUTCOME_SUCCESS, event_id=getattr(mail_instance.event, 'pk', None), object_id=mail_instance.pk)
             record_usage(
                 event.organizer,
                 'email.bulk.monthly',

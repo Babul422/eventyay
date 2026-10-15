@@ -1556,3 +1556,125 @@ def test_sendmail_team_serializes_with_organizer_select_for_update(logged_in_cli
     assert response.status_code == 200
     assert 'alert-success' in response.rendered_content
     assert locked_organizers == [event.organizer_id]
+
+
+@pytest.mark.django_db
+@override_settings(DEBUG=True)
+def test_sendmail_attendee_draft_to_outbox_logs_enqueue_event(logged_in_client, sendmail_url, event, order, pos, monkeypatch):
+    from eventyay.base.operational_logging import OUTCOME_SUCCESS
+    from eventyay.plugins.sendmail.models import ComposingFor, EmailQueue, EmailQueueFilter
+
+    draft = EmailQueue.objects.create(
+        event=event,
+        composing_for=ComposingFor.ATTENDEES,
+        subject='Draft Subject to Enqueue',
+        message='Draft Message to Enqueue',
+        is_draft=True,
+    )
+    EmailQueueFilter.objects.create(
+        mail=draft,
+        recipients='orders',
+        order_status=['na'],
+        orders=[order.pk],
+        products=[pos.product_id],
+    )
+
+    logged_events = []
+
+    def spy_log_event(component, action, outcome, **kwargs):
+        logged_events.append({
+            'component': component,
+            'action': action,
+            'outcome': outcome,
+            'kwargs': kwargs,
+        })
+
+    monkeypatch.setattr('eventyay.plugins.sendmail.views.log_event', spy_log_event)
+
+    response = logged_in_client.post(
+        sendmail_url,
+        {
+            'draft_id': draft.pk,
+            'order_status': 'na',
+            'recipients': 'orders',
+            'products': [pos.product_id],
+            'subject_0': 'Sending Draft Subject',
+            'text_0': 'Sending Draft Message',
+        },
+        follow=True,
+    )
+    assert response.status_code == 200
+    assert 'alert-success' in response.rendered_content
+
+    draft.refresh_from_db()
+    assert draft.is_draft is False
+
+    enqueue_events = [e for e in logged_events if e['action'] == 'mail.enqueue']
+    assert len(enqueue_events) == 1
+    assert enqueue_events[0]['component'] == 'mail'
+    assert enqueue_events[0]['outcome'] == OUTCOME_SUCCESS
+    assert enqueue_events[0]['kwargs']['event_id'] == event.pk
+    assert enqueue_events[0]['kwargs']['object_id'] == draft.pk
+
+
+@pytest.mark.django_db
+@override_settings(DEBUG=True)
+def test_sendmail_team_draft_to_outbox_logs_enqueue_event(logged_in_client, event, monkeypatch):
+    from eventyay.base.operational_logging import OUTCOME_SUCCESS
+    from eventyay.plugins.sendmail.models import ComposingFor, EmailQueue, EmailQueueFilter
+
+    u = User.objects.create(email='teammate_log@example.com')
+    team = Team.objects.create(organizer=event.organizer, name='LogCrew', can_view_orders=True)
+    team.members.add(u)
+
+    draft = EmailQueue.objects.create(
+        event=event,
+        composing_for=ComposingFor.TEAMS,
+        subject='Team Draft Subject to Enqueue',
+        message='Team Draft Message to Enqueue',
+        is_draft=True,
+    )
+    EmailQueueFilter.objects.create(
+        mail=draft,
+        teams=[team.pk],
+    )
+
+    compose_teams_url = reverse(
+        'control:event.mail.compose_teams',
+        kwargs={'organizer': event.organizer.slug, 'event': event.slug},
+    )
+
+    logged_events = []
+
+    def spy_log_event(component, action, outcome, **kwargs):
+        logged_events.append({
+            'component': component,
+            'action': action,
+            'outcome': outcome,
+            'kwargs': kwargs,
+        })
+
+    monkeypatch.setattr('eventyay.plugins.sendmail.views.log_event', spy_log_event)
+
+    response = logged_in_client.post(
+        compose_teams_url,
+        {
+            'draft_id': draft.pk,
+            'teams': [team.pk],
+            'subject_0': 'Sending Team Draft Subject',
+            'message_0': 'Sending Team Draft Message',
+        },
+        follow=True,
+    )
+    assert response.status_code == 200
+    assert 'alert-success' in response.rendered_content
+
+    draft.refresh_from_db()
+    assert draft.is_draft is False
+
+    enqueue_events = [e for e in logged_events if e['action'] == 'mail.enqueue']
+    assert len(enqueue_events) == 1
+    assert enqueue_events[0]['component'] == 'mail'
+    assert enqueue_events[0]['outcome'] == OUTCOME_SUCCESS
+    assert enqueue_events[0]['kwargs']['event_id'] == event.pk
+    assert enqueue_events[0]['kwargs']['object_id'] == draft.pk
