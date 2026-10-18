@@ -1,5 +1,8 @@
+from pathlib import Path
+
 import pytest
 from django.core.exceptions import ValidationError
+from reportlab.pdfbase.ttfonts import TTFontFile
 
 from eventyay.common.text.css import validate_css
 
@@ -50,9 +53,6 @@ def test_invalid_css(invalid_css):
 
 
 def test_open_sans_font_assets_exist_and_contain_eastern_european_glyphs():
-    from pathlib import Path
-    from reportlab.pdfbase.ttfonts import TTFontFile
-
     fonts_dir = Path(__file__).resolve().parents[3] / 'eventyay' / 'static' / 'fonts'
     font_files = [
         'OpenSans-Regular.ttf',
@@ -73,8 +73,6 @@ def test_open_sans_font_assets_exist_and_contain_eastern_european_glyphs():
 
 
 def test_open_sans_css_declarations():
-    from pathlib import Path
-
     static_dir = Path(__file__).resolve().parents[3] / 'eventyay' / 'static'
     open_sans_css = (static_dir / 'common' / 'css' / 'open_sans.css').read_text()
     fonts_css = (static_dir / 'common' / 'css' / '_fonts.css').read_text()
@@ -90,8 +88,6 @@ def test_open_sans_css_declarations():
 
 
 def test_open_sans_stylesheet_included_in_templates():
-    from pathlib import Path
-
     eventyay_dir = Path(__file__).resolve().parents[3] / 'eventyay'
     templates = [
         eventyay_dir / 'presale' / 'templates' / 'pretixpresale' / 'base.html',
