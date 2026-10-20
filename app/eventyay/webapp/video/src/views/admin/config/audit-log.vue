@@ -14,8 +14,8 @@
 			div.logentry.table-row(@click.prevent="detailsPrompt = entry")
 				.timestamp {{ moment(entry.timestamp).format('L LT') }}
 				.user
-					avatar.avatar(:user="entry.user", :size="32")
-					.name {{ entry.user.profile.display_name }}
+					avatar.avatar(v-if="entry.user", :user="entry.user", :size="32")
+					.name {{ entry.user ? (entry.user.profile?.display_name || entry.user.id) : $t('System / Deleted') }}
 				.type(:title="entry.type") {{ entry.type }}
 				.data {{ entry.data }}
 		bunt-progress-circular(v-else, size="huge", :page="true")
@@ -31,6 +31,9 @@
 						.meta-item(v-if="detailsPrompt.user")
 							span.label {{ $t('User') }}:
 							span.value {{ detailsPrompt.user.profile?.display_name || detailsPrompt.user.id }}
+						.meta-item(v-else)
+							span.label {{ $t('User') }}:
+							span.value {{ $t('System / Deleted') }}
 						.meta-item
 							span.label {{ $t('Action') }}:
 							span.value.type-badge {{ detailsPrompt.type }}
@@ -61,7 +64,7 @@ export default {
 		filteredEntries() {
 			if (!this.entries) return
 			if (!this.search) return this.entries
-			return this.entries.filter(entry => entry.user?.profile?.display_name?.toLowerCase()?.indexOf(this.search.toLowerCase()) >= 0 || entry.type?.toLowerCase()?.startsWith(this.search.toLowerCase()) || JSON.stringify(entry.data)?.toLowerCase()?.indexOf(this.search.toLowerCase()) >= 0)
+			return this.entries.filter(entry => entry.user?.profile?.display_name?.toLowerCase()?.indexOf(this.search.toLowerCase()) >= 0 || (!entry.user && (this.$t('System / Deleted').toLowerCase().indexOf(this.search.toLowerCase()) >= 0 || 'system / deleted'.indexOf(this.search.toLowerCase()) >= 0)) || entry.type?.toLowerCase()?.startsWith(this.search.toLowerCase()) || JSON.stringify(entry.data)?.toLowerCase()?.indexOf(this.search.toLowerCase()) >= 0)
 		}
 	},
 	created() {
