@@ -15,7 +15,7 @@
 				.timestamp {{ moment(entry.timestamp).format('L LT') }}
 				.user
 					avatar.avatar(v-if="entry.user", :user="entry.user", :size="32")
-					.name {{ entry.user ? (entry.user.profile?.display_name || entry.user.id) : $t('System / Deleted') }}
+					.name {{ getUserDisplay(entry.user) }}
 				.type(:title="entry.type") {{ entry.type }}
 				.data {{ entry.data }}
 		bunt-progress-circular(v-else, size="huge", :page="true")
@@ -28,12 +28,9 @@
 						.meta-item
 							span.label {{ $t('Timestamp') }}:
 							span.value {{ moment(detailsPrompt.timestamp).format('L LTS') }}
-						.meta-item(v-if="detailsPrompt.user")
+						.meta-item
 							span.label {{ $t('User') }}:
-							span.value {{ detailsPrompt.user.profile?.display_name || detailsPrompt.user.id }}
-						.meta-item(v-else)
-							span.label {{ $t('User') }}:
-							span.value {{ $t('System / Deleted') }}
+							span.value {{ getUserDisplay(detailsPrompt.user) }}
 						.meta-item
 							span.label {{ $t('Action') }}:
 							span.value.type-badge {{ detailsPrompt.type }}
@@ -48,6 +45,7 @@ import api from 'lib/api'
 import moment from 'moment'
 import Avatar from 'components/Avatar'
 import Prompt from 'components/Prompt'
+import { getAuditLogUserDisplay, filterAuditLogEntries } from 'lib/audit-log'
 
 export default {
 	name: 'AuditLog',
@@ -62,9 +60,7 @@ export default {
 	},
 	computed: {
 		filteredEntries() {
-			if (!this.entries) return
-			if (!this.search) return this.entries
-			return this.entries.filter(entry => entry.user?.profile?.display_name?.toLowerCase()?.indexOf(this.search.toLowerCase()) >= 0 || (!entry.user && (this.$t('System / Deleted').toLowerCase().indexOf(this.search.toLowerCase()) >= 0 || 'system / deleted'.indexOf(this.search.toLowerCase()) >= 0)) || entry.type?.toLowerCase()?.startsWith(this.search.toLowerCase()) || JSON.stringify(entry.data)?.toLowerCase()?.indexOf(this.search.toLowerCase()) >= 0)
+			return filterAuditLogEntries(this.entries, this.search, this.$t ? this.$t('System / Deleted') : 'System / Deleted')
 		}
 	},
 	created() {
@@ -74,6 +70,9 @@ export default {
 		if (this._unwatchConnected) this._unwatchConnected()
 	},
 	methods: {
+		getUserDisplay(user) {
+			return getAuditLogUserDisplay(user, this.$t ? this.$t('System / Deleted') : 'System / Deleted')
+		},
 		ensureConnectedAndFetch() {
 			if (this.$store.state.connected) {
 				this.fetchEntries()

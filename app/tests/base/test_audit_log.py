@@ -1,6 +1,6 @@
 import pytest
 from django.utils.timezone import now
-from django_scopes import scopes_disabled
+from django_scopes import scope, scopes_disabled
 
 from eventyay.base.models import Event, Organizer, User
 from eventyay.base.models.audit import AuditLog
@@ -15,6 +15,8 @@ def test_audit_log_serialize_public_with_null_user():
         event = Event.objects.create(
             organizer=organizer, name='Audit Event', slug='audit-event-null', date_from=now()
         )
+
+    with scope(event=event):
         log = AuditLog.objects.create(
             event=event,
             user=None,
@@ -38,6 +40,8 @@ def test_audit_log_serialize_public_with_active_user():
             organizer=organizer, name='Audit Event', slug='audit-event-user', date_from=now()
         )
         user = User.objects.create(email='active_auditor@example.com')
+
+    with scope(event=event):
         log = AuditLog.objects.create(
             event=event,
             user=user,
@@ -61,6 +65,7 @@ def test_create_room_with_creator_none_serializes_cleanly():
             organizer=organizer, name='Room Event', slug='room-event-null', date_from=now()
         )
 
+    with scope(event=event):
         create_room_fn = getattr(_create_room, 'func', _create_room)
         room, _ = create_room_fn(
             data={'event': event, 'name': 'Main Track Room'},
@@ -88,6 +93,7 @@ def test_get_audit_log_retrieves_multiple_entries_with_null_user():
         user1 = User.objects.create(email='u1_mixed@example.com')
         user2 = User.objects.create(email='u2_mixed@example.com')
 
+    with scope(event=event):
         AuditLog.objects.create(event=event, user=user1, type='event.updated', data={'step': 1})
         AuditLog.objects.create(event=event, user=None, type='event.room.added', data={'step': 2})
         AuditLog.objects.create(event=event, user=user2, type='room.updated', data={'step': 3})
@@ -112,6 +118,8 @@ def test_user_deletion_cascades_to_null_and_preserves_audit_log():
             organizer=organizer, name='Del Event', slug='del-event-cascade', date_from=now()
         )
         user = User.objects.create(email='deleted_auditor@example.com')
+
+    with scope(event=event):
         log = AuditLog.objects.create(
             event=event, user=user, type='auth.user.banned', data={'reason': 'abuse'}
         )
@@ -121,8 +129,11 @@ def test_user_deletion_cascades_to_null_and_preserves_audit_log():
         assert len(initial_results) == 1
         assert initial_results[0]['user']['id'] == str(user.id)
 
-        # Delete user - SET_NULL cascades on the foreign key
+    # Delete user outside event scope (global model)
+    with scopes_disabled():
         user.delete()
+
+    with scope(event=event):
         log.refresh_from_db()
         assert log.user is None
 
