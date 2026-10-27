@@ -460,3 +460,256 @@ def test_orga_can_update_speaker_information_resource(
         assert speaker_info.title == "Updated Title Only"
         assert speaker_info.resource.name == current_resource_path
         assert speaker_info.resource.read() == b"Second PDF content"
+
+
+@pytest.mark.django_db
+def test_update_speaker_information_storage_failure_rolls_back(
+    client, orga_user_write_token, event, monkeypatch
+):
+    session_key = (
+        f"api-upload-{str(type(orga_user_write_token.user))}-{orga_user_write_token.user.pk}"
+    )
+    first_file = CachedFile.objects.create(
+        filename="first.pdf",
+        type="application/pdf",
+        session_key=session_key,
+    )
+    first_file.file.save("first.pdf", ContentFile(b"First PDF content"))
+
+    with scope(event=event):
+        speaker_info = event.information.create(
+            title="Original Title",
+            text="Initial text",
+            target_group="accepted",
+        )
+        speaker_info.resource.save("first.pdf", first_file.file, save=True)
+        initial_path = speaker_info.resource.name
+
+    second_file = CachedFile.objects.create(
+        filename="second.pdf",
+        type="application/pdf",
+        session_key=session_key,
+    )
+    second_file.file.save("second.pdf", ContentFile(b"Second PDF content"))
+
+    from django.db.models.fields.files import FieldFile
+    orig_save = FieldFile.save
+
+    def failing_save(self, name, content, save=True):
+        if not save:
+            raise OSError("Simulated storage failure: disk full")
+        return orig_save(self, name, content, save=save)
+
+    monkeypatch.setattr(FieldFile, "save", failing_save)
+
+    with pytest.raises(OSError, match="Simulated storage failure"):
+        client.patch(
+            event.api_urls.speaker_information + f"{speaker_info.pk}/",
+            follow=True,
+            data=json.dumps({
+                "title": "New Title That Should Roll Back",
+                "resource": f"file:{second_file.pk}",
+            }),
+            headers={
+                "Authorization": f"Token {orga_user_write_token.token}",
+                "Content-Type": "application/json",
+            },
+        )
+
+    with scope(event=event):
+        speaker_info.refresh_from_db()
+        assert speaker_info.title == "Original Title"
+        assert speaker_info.resource.name == initial_path
+        assert speaker_info.resource.read() == b"First PDF content"
+
+
+@pytest.mark.django_db
+def test_update_speaker_information_db_failure_cleans_up_new_file(
+    client, orga_user_write_token, event, monkeypatch
+):
+    session_key = (
+        f"api-upload-{str(type(orga_user_write_token.user))}-{orga_user_write_token.user.pk}"
+    )
+    first_file = CachedFile.objects.create(
+        filename="first.pdf",
+        type="application/pdf",
+        session_key=session_key,
+    )
+    first_file.file.save("first.pdf", ContentFile(b"First PDF content"))
+
+    with scope(event=event):
+        speaker_info = event.information.create(
+            title="Original Title",
+            text="Initial text",
+            target_group="accepted",
+        )
+        speaker_info.resource.save("first.pdf", first_file.file, save=True)
+        initial_path = speaker_info.resource.name
+        initial_storage = speaker_info.resource.storage
+
+    assert initial_storage.exists(initial_path)
+
+    second_file = CachedFile.objects.create(
+        filename="second.pdf",
+        type="application/pdf",
+        session_key=session_key,
+    )
+    second_file.file.save("second.pdf", ContentFile(b"Second PDF content"))
+
+    from django.db import DatabaseError
+
+    from eventyay.base.models.information import SpeakerInformation
+
+    orig_save = SpeakerInformation.save
+    saved_new_paths = []
+
+    def failing_save(self, *args, **kwargs):
+        update_fields = kwargs.get("update_fields")
+        if update_fields and "resource" in update_fields:
+            saved_new_paths.append(self.resource.name)
+            raise DatabaseError("Simulated database failure during resource save")
+        return orig_save(self, *args, **kwargs)
+
+    monkeypatch.setattr(SpeakerInformation, "save", failing_save)
+
+    with pytest.raises(DatabaseError, match="Simulated database failure"):
+        client.patch(
+            event.api_urls.speaker_information + f"{speaker_info.pk}/",
+            follow=True,
+            data=json.dumps({
+                "title": "Title Should Roll Back",
+                "resource": f"file:{second_file.pk}",
+            }),
+            headers={
+                "Authorization": f"Token {orga_user_write_token.token}",
+                "Content-Type": "application/json",
+            },
+        )
+
+    # Verify database rollback
+    with scope(event=event):
+        speaker_info.refresh_from_db()
+        assert speaker_info.title == "Original Title"
+        assert speaker_info.resource.name == initial_path
+
+    # Verify existing resource was not deleted
+    assert initial_storage.exists(initial_path)
+
+    # Verify newly written file was cleaned up from storage
+    assert len(saved_new_paths) == 1
+    new_path = saved_new_paths[0]
+    assert new_path != initial_path
+    assert not initial_storage.exists(new_path)
+
+
+@pytest.mark.django_db
+def test_speaker_information_task_cleanup_file_deletes_old_file_and_preserves_current(
+    event,
+):
+    from django.core.files.storage import default_storage
+
+    from eventyay.common.tasks import task_cleanup_file
+
+    with scope(event=event):
+        speaker_info = event.information.create(
+            title="Cleanup Test Info",
+            text="Initial text",
+            target_group="accepted",
+        )
+        speaker_info.resource.save(
+            "current.pdf", ContentFile(b"Current file content"), save=True
+        )
+        current_path = speaker_info.resource.path
+
+    # Create an old orphan file that was replaced
+    old_path = default_storage.save(
+        f"{event.slug}/speaker_information/old_orphan.pdf",
+        ContentFile(b"Old file content"),
+    )
+    old_abs_path = default_storage.path(old_path)
+    assert default_storage.exists(old_path)
+    assert default_storage.exists(current_path)
+
+    # 1. Run task_cleanup_file for the old replaced path -> should delete it
+    task_cleanup_file(
+        model="Speakerinformation",
+        pk=speaker_info.pk,
+        field="resource",
+        path=old_abs_path,
+    )
+    assert not default_storage.exists(old_path)
+    assert default_storage.exists(current_path)
+
+    # 2. Safety check: Run task_cleanup_file pointing to CURRENT file -> must NOT delete it
+    task_cleanup_file(
+        model="Speakerinformation",
+        pk=speaker_info.pk,
+        field="resource",
+        path=current_path,
+    )
+    assert default_storage.exists(current_path)
+
+
+@pytest.mark.django_db
+def test_update_speaker_information_enqueue_failure_does_not_abort_request(
+    client, orga_user_write_token, event, monkeypatch, caplog
+):
+
+    from eventyay.common.tasks import task_cleanup_file
+
+    session_key = (
+        f"api-upload-{str(type(orga_user_write_token.user))}-{orga_user_write_token.user.pk}"
+    )
+    first_file = CachedFile.objects.create(
+        filename="first.pdf",
+        type="application/pdf",
+        session_key=session_key,
+    )
+    first_file.file.save("first.pdf", ContentFile(b"First PDF content"))
+
+    with scope(event=event):
+        speaker_info = event.information.create(
+            title="Initial Title",
+            text="Initial text",
+            target_group="accepted",
+        )
+        speaker_info.resource.save("first.pdf", first_file.file, save=True)
+
+    second_file = CachedFile.objects.create(
+        filename="second.pdf",
+        type="application/pdf",
+        session_key=session_key,
+    )
+    second_file.file.save("second.pdf", ContentFile(b"Second PDF content"))
+
+    def broken_apply_async(*args, **kwargs):
+        raise ConnectionError("Simulated Celery broker connection failure")
+
+    monkeypatch.setattr(task_cleanup_file, "apply_async", broken_apply_async)
+
+    from django.test import TestCase
+
+    tc = TestCase()
+    with caplog.at_level("WARNING"):
+        with tc.captureOnCommitCallbacks(execute=True):
+            response = client.patch(
+                event.api_urls.speaker_information + f"{speaker_info.pk}/",
+                follow=True,
+                data=json.dumps({"resource": f"file:{second_file.pk}"}),
+                headers={
+                    "Authorization": f"Token {orga_user_write_token.token}",
+                    "Content-Type": "application/json",
+                },
+            )
+
+    assert response.status_code == 200, response.text
+
+    with scope(event=event):
+        speaker_info.refresh_from_db()
+        assert speaker_info.resource.read() == b"Second PDF content"
+
+    # Verify enqueue failure was logged with context
+    assert any(
+        "Failed to enqueue cleanup task" in record.message
+        for record in caplog.records
+    )
