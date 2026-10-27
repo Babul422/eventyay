@@ -5,6 +5,7 @@ from django.core.files.base import ContentFile
 from django_scopes import scope
 
 from eventyay.api.serializers.speaker_information import SpeakerInformationSerializer
+from eventyay.base.models import CachedFile
 
 
 @pytest.mark.django_db
@@ -374,3 +375,88 @@ def test_orga_cannot_assign_track_from_other_event(
 
     with scope(event=event):
         assert not event.information.filter(title="New Test Info").exists()
+
+
+@pytest.mark.django_db
+def test_orga_can_update_speaker_information_resource(
+    client, orga_user_write_token, event
+):
+    session_key = (
+        f"api-upload-{str(type(orga_user_write_token.user))}-{orga_user_write_token.user.pk}"
+    )
+    first_file = CachedFile.objects.create(
+        filename="first.pdf",
+        type="application/pdf",
+        session_key=session_key,
+    )
+    first_file.file.save("first.pdf", ContentFile(b"First PDF content"))
+
+    response = client.post(
+        event.api_urls.speaker_information,
+        follow=True,
+        data={
+            "title": "Info with Resource",
+            "text": "Initial text",
+            "target_group": "accepted",
+            "resource": f"file:{first_file.pk}",
+        },
+        content_type="application/json",
+        headers={
+            "Authorization": f"Token {orga_user_write_token.token}",
+        },
+    )
+    assert response.status_code == 201, response.text
+    info_id = response.data["id"]
+
+    with scope(event=event):
+        speaker_info = event.information.get(pk=info_id)
+        assert speaker_info.resource is not None
+        assert speaker_info.resource.name.endswith(".pdf")
+        assert speaker_info.resource.read() == b"First PDF content"
+        initial_resource_path = speaker_info.resource.name
+
+    second_file = CachedFile.objects.create(
+        filename="second.pdf",
+        type="application/pdf",
+        session_key=session_key,
+    )
+    second_file.file.save("second.pdf", ContentFile(b"Second PDF content"))
+
+    # PATCH existing speaker information entry with the second file
+    response = client.patch(
+        event.api_urls.speaker_information + f"{info_id}/",
+        follow=True,
+        data=json.dumps({"resource": f"file:{second_file.pk}"}),
+        headers={
+            "Authorization": f"Token {orga_user_write_token.token}",
+            "Content-Type": "application/json",
+        },
+    )
+    assert response.status_code == 200, response.text
+    content = json.loads(response.text)
+    assert content["resource"].startswith("http")
+    assert content["resource"].endswith(".pdf")
+
+    with scope(event=event):
+        speaker_info.refresh_from_db()
+        assert speaker_info.resource.name != initial_resource_path
+        assert speaker_info.resource.name.endswith(".pdf")
+        assert speaker_info.resource.read() == b"Second PDF content"
+        current_resource_path = speaker_info.resource.name
+
+    # Verify ordinary partial update works without modifying the attached resource
+    response = client.patch(
+        event.api_urls.speaker_information + f"{info_id}/",
+        follow=True,
+        data=json.dumps({"title": "Updated Title Only"}),
+        headers={
+            "Authorization": f"Token {orga_user_write_token.token}",
+            "Content-Type": "application/json",
+        },
+    )
+    assert response.status_code == 200, response.text
+    with scope(event=event):
+        speaker_info.refresh_from_db()
+        assert speaker_info.title == "Updated Title Only"
+        assert speaker_info.resource.name == current_resource_path
+        assert speaker_info.resource.read() == b"Second PDF content"
