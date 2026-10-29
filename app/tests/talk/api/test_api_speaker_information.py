@@ -713,3 +713,197 @@ def test_update_speaker_information_enqueue_failure_does_not_abort_request(
         "Failed to enqueue cleanup task" in record.message
         for record in caplog.records
     )
+
+
+@pytest.mark.django_db
+def test_orga_can_clear_speaker_information_resource(
+    client, orga_user_write_token, event
+):
+    session_key = (
+        f"api-upload-{str(type(orga_user_write_token.user))}-{orga_user_write_token.user.pk}"
+    )
+    first_file = CachedFile.objects.create(
+        filename="first.pdf",
+        type="application/pdf",
+        session_key=session_key,
+    )
+    first_file.file.save("first.pdf", ContentFile(b"First PDF content"))
+
+    with scope(event=event):
+        speaker_info = event.information.create(
+            title="Info with Resource",
+            text="Initial text",
+            target_group="accepted",
+        )
+        speaker_info.resource.save("first.pdf", first_file.file, save=True)
+
+    with scope(event=event):
+        speaker_info.refresh_from_db()
+        assert speaker_info.resource is not None
+        assert bool(speaker_info.resource) is True
+
+    response = client.patch(
+        event.api_urls.speaker_information + f"{speaker_info.pk}/",
+        follow=True,
+        data=json.dumps({"resource": None}),
+        headers={
+            "Authorization": f"Token {orga_user_write_token.token}",
+            "Content-Type": "application/json",
+        },
+    )
+    assert response.status_code == 200, response.text
+    content = json.loads(response.text)
+    assert content["resource"] is None
+
+    with scope(event=event):
+        speaker_info.refresh_from_db()
+        assert not speaker_info.resource
+        assert speaker_info.resource.name == ""
+
+
+@pytest.mark.django_db
+def test_orga_can_clear_already_empty_speaker_information_resource(
+    client, orga_user_write_token, event
+):
+    with scope(event=event):
+        speaker_info = event.information.create(
+            title="Info without Resource",
+            text="Initial text",
+            target_group="accepted",
+        )
+
+    response = client.patch(
+        event.api_urls.speaker_information + f"{speaker_info.pk}/",
+        follow=True,
+        data=json.dumps({"resource": None}),
+        headers={
+            "Authorization": f"Token {orga_user_write_token.token}",
+            "Content-Type": "application/json",
+        },
+    )
+    assert response.status_code == 200, response.text
+    content = json.loads(response.text)
+    assert content["resource"] is None
+
+    with scope(event=event):
+        speaker_info.refresh_from_db()
+        assert not speaker_info.resource
+
+
+@pytest.mark.django_db
+def test_clear_speaker_information_resource_cleanup_post_commit_not_before(
+    client, orga_user_write_token, event
+):
+    from django.test import TestCase
+
+    session_key = (
+        f"api-upload-{str(type(orga_user_write_token.user))}-{orga_user_write_token.user.pk}"
+    )
+    first_file = CachedFile.objects.create(
+        filename="first.pdf",
+        type="application/pdf",
+        session_key=session_key,
+    )
+    first_file.file.save("first.pdf", ContentFile(b"First PDF content"))
+
+    with scope(event=event):
+        speaker_info = event.information.create(
+            title="Info with Resource",
+            text="Initial text",
+            target_group="accepted",
+        )
+        speaker_info.resource.save("first.pdf", first_file.file, save=True)
+        initial_path = speaker_info.resource.name
+        storage = speaker_info.resource.storage
+
+    assert storage.exists(initial_path)
+
+    tc = TestCase()
+    with tc.captureOnCommitCallbacks(execute=False) as callbacks:
+        response = client.patch(
+            event.api_urls.speaker_information + f"{speaker_info.pk}/",
+            follow=True,
+            data=json.dumps({"resource": None}),
+            headers={
+                "Authorization": f"Token {orga_user_write_token.token}",
+                "Content-Type": "application/json",
+            },
+        )
+        assert response.status_code == 200, response.text
+        # Before callbacks execute (prior to commit completion), file still exists
+        assert storage.exists(initial_path)
+
+    # Post-commit callback enqueues cleanup which deletes the old file
+    assert len(callbacks) >= 1
+    for cb in callbacks:
+        cb()
+    assert not storage.exists(initial_path)
+
+    with scope(event=event):
+        speaker_info.refresh_from_db()
+        assert not speaker_info.resource
+
+
+@pytest.mark.django_db
+def test_clear_speaker_information_resource_db_failure_rolls_back_and_preserves_file(
+    client, orga_user_write_token, event, monkeypatch
+):
+    from django.db import DatabaseError
+
+    from eventyay.base.models.information import SpeakerInformation
+
+    session_key = (
+        f"api-upload-{str(type(orga_user_write_token.user))}-{orga_user_write_token.user.pk}"
+    )
+    first_file = CachedFile.objects.create(
+        filename="first.pdf",
+        type="application/pdf",
+        session_key=session_key,
+    )
+    first_file.file.save("first.pdf", ContentFile(b"First PDF content"))
+
+    with scope(event=event):
+        speaker_info = event.information.create(
+            title="Original Title",
+            text="Initial text",
+            target_group="accepted",
+        )
+        speaker_info.resource.save("first.pdf", first_file.file, save=True)
+        initial_path = speaker_info.resource.name
+        initial_storage = speaker_info.resource.storage
+
+    assert initial_storage.exists(initial_path)
+
+    orig_save = SpeakerInformation.save
+
+    def failing_save(self, *args, **kwargs):
+        update_fields = kwargs.get("update_fields")
+        if update_fields and "resource" in update_fields and not self.resource:
+            raise DatabaseError("Simulated database failure during resource clear")
+        return orig_save(self, *args, **kwargs)
+
+    monkeypatch.setattr(SpeakerInformation, "save", failing_save)
+
+    with pytest.raises(DatabaseError, match="Simulated database failure during resource clear"):
+        client.patch(
+            event.api_urls.speaker_information + f"{speaker_info.pk}/",
+            follow=True,
+            data=json.dumps({
+                "title": "Title Should Roll Back",
+                "resource": None,
+            }),
+            headers={
+                "Authorization": f"Token {orga_user_write_token.token}",
+                "Content-Type": "application/json",
+            },
+        )
+
+    # Verify database rollback
+    with scope(event=event):
+        speaker_info.refresh_from_db()
+        assert speaker_info.title == "Original Title"
+        assert speaker_info.resource.name == initial_path
+        assert speaker_info.resource.read() == b"First PDF content"
+
+    # Verify existing file was not deleted
+    assert initial_storage.exists(initial_path)

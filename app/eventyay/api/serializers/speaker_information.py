@@ -13,7 +13,7 @@ from eventyay.base.models.type import SubmissionType
 
 @register_serializer(versions=CURRENT_VERSIONS)
 class SpeakerInformationSerializer(FlexFieldsSerializerMixin, PretalxSerializer):
-    resource = UploadedFileField(required=False)
+    resource = UploadedFileField(required=False, allow_null=True)
 
     class Meta:
         model = SpeakerInformation
@@ -63,17 +63,22 @@ class SpeakerInformationSerializer(FlexFieldsSerializerMixin, PretalxSerializer)
         return instance
 
     def update(self, instance, validated_data):
+        has_resource = "resource" in validated_data
         resource = validated_data.pop("resource", None)
         with transaction.atomic():
             instance = super().update(instance, validated_data)
-            if resource:
-                old_resource_name = instance.resource.name if instance.resource else None
-                instance.resource.save(Path(resource.name).name, resource, save=False)
-                new_saved_name = instance.resource.name
-                try:
+            if has_resource:
+                if resource:
+                    old_resource_name = instance.resource.name if instance.resource else None
+                    instance.resource.save(Path(resource.name).name, resource, save=False)
+                    new_saved_name = instance.resource.name
+                    try:
+                        instance.save(update_fields=("resource",))
+                    except Exception:
+                        if new_saved_name and new_saved_name != old_resource_name:
+                            instance.resource.storage.delete(new_saved_name)
+                        raise
+                else:
+                    instance.resource = None
                     instance.save(update_fields=("resource",))
-                except Exception:
-                    if new_saved_name and new_saved_name != old_resource_name:
-                        instance.resource.storage.delete(new_saved_name)
-                    raise
         return instance
